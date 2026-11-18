@@ -1,9 +1,9 @@
-
 package main
 
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +25,7 @@ import (
 const (
 	defaultBaseURL = "https://api.nodeobjects.com/"
 	posterBaseURL  = "https://static.nodeobjects.com/thumbnail/"
+	providerID     = "dramachi"
 )
 
 type Config struct {
@@ -42,49 +43,26 @@ type Client struct {
 }
 
 type cacheEntry struct {
-	Data      json.RawMessage
+	Data      []byte
 	ExpiresAt time.Time
 }
 
-type APIError struct {
-	Status  int    `json:"status"`
-	Message string `json:"message"`
+type ProviderError struct {
+	Code      string
+	Message   string
+	Retryable bool
 }
 
-type SearchItem struct {
-	ID       string `json:"id"`
-	Title    string `json:"title"`
-	Thumb    string `json:"thumb"`
-	Year     string `json:"year"`
-	Category string `json:"category"`
-	Content  string `json:"content"`
+func (e *ProviderError) Error() string {
+	return e.Message
 }
 
-type SearchResponse struct {
-	Items    []SearchItem `json:"items"`
-	Page     int          `json:"page"`
-	LastPage int          `json:"last_page,omitempty"`
-	NextPage int          `json:"next_page,omitempty"`
-}
-
-type Season struct {
-	Name       string `json:"name"`
-	Version    string `json:"version"`
-	RIP        string `json:"rip"`
-	Server     string `json:"server,omitempty"`
-	TitleID    string `json:"title_id"`
-	Identifier string `json:"identifier"`
-}
-
-type Episode struct {
-	Title   string `json:"title"`
-	RIP     string `json:"rip"`
-	FTitle  string `json:"f_title"`
-	FID     string `json:"fid"`
-	Disk    string `json:"disk"`
-	Quality string `json:"quality"`
-	Size    string `json:"size"`
-	Number  int    `json:"number"`
+type EpisodeRef struct {
+	TitleID string `json:"t"`
+	RIP     string `json:"r"`
+	FID     string `json:"f"`
+	Disk    string `json:"d"`
+	Number  int    `json:"n"`
 }
 
 type FileInfo struct {
@@ -93,17 +71,6 @@ type FileInfo struct {
 	Size     string `json:"size"`
 	Host     string `json:"host"`
 	IsDL     bool   `json:"isDL"`
-}
-
-type Source struct {
-	Provider string `json:"provider"`
-	Title    string `json:"title"`
-	URL      string `json:"url"`
-	Filename string `json:"filename"`
-	Quality  string `json:"quality,omitempty"`
-	Size     string `json:"size,omitempty"`
-	Host     string `json:"host,omitempty"`
-	IsDirect bool   `json:"is_direct"`
 }
 
 func NewClient() *Client {
@@ -138,7 +105,11 @@ func envInt(key string, fallback int) int {
 	return value
 }
 
-func (c *Client) cacheGet(key string) (json.RawMessage, bool) {
+// --------------------------------------------------
+// CACHE
+// --------------------------------------------------
+
+func (c *Client) cacheGet(key string) ([]byte, bool) {
 	c.mu.RLock()
 	entry, ok := c.cache[key]
 	c.mu.RUnlock()
@@ -146,7 +117,8 @@ func (c *Client) cacheGet(key string) (json.RawMessage, bool) {
 	if !ok || time.Now().After(entry.ExpiresAt) {
 		return nil, false
 	}
-	return entry.Data, true
+
+	return append([]byte(nil), entry.Data...), true
 }
 
 func (c *Client) cacheSet(key string, data []byte) {
@@ -154,24 +126,32 @@ func (c *Client) cacheSet(key string, data []byte) {
 	defer c.mu.Unlock()
 
 	if len(c.cache) > 500 {
-		for k, v := range c.cache {
-			if time.Now().After(v.ExpiresAt) {
-				delete(c.cache, k)
+		now := time.Now()
+		for key, item := range c.cache {
+			if now.After(item.ExpiresAt) {
+				delete(c.cache, key)
 			}
 		}
 	}
 
 	c.cache[key] = cacheEntry{
-		Data:      append(json.RawMessage(nil), data...),
+		Data:      append([]byte(nil), data...),
 		ExpiresAt: time.Now().Add(c.config.CacheTTL),
 	}
 }
 
-func (c *Client) request(ctx context.Context, params url.Values) ([]byte, error) {
+// --------------------------------------------------
+// UPSTREAM REQUEST
+// --------------------------------------------------
+
+func (c *Client) request(
+	ctx context.Context,
+	params url.Values,
+) ([]byte, error) {
 	endpoint := c.config.BaseURL + "?" + params.Encode()
 
-	cacheKeyBytes := sha256.Sum256([]byte(endpoint))
-	cacheKey := hex.EncodeToString(cacheKeyBytes[:])
+	hash := sha256.Sum256([]byte(endpoint))
+	cacheKey := hex.EncodeToString(hash[:])
 
 	if cached, ok := c.cacheGet(cacheKey); ok {
 		return cached, nil
@@ -180,7 +160,12 @@ func (c *Client) request(ctx context.Context, params url.Values) ([]byte, error)
 	var lastErr error
 
 	for attempt := 0; attempt <= c.config.Retries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodGet,
+			endpoint,
+			nil,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -189,28 +174,40 @@ func (c *Client) request(ctx context.Context, params url.Values) ([]byte, error)
 		req.Header.Set("User-Agent", "Prophecy-Dramachi-Server/1.0")
 
 		resp, err := c.httpClient.Do(req)
+
 		if err != nil {
 			lastErr = err
 		} else {
-			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+			body, readErr := io.ReadAll(
+				io.LimitReader(resp.Body, 8<<20),
+			)
 			resp.Body.Close()
 
 			if readErr != nil {
 				lastErr = readErr
-			} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			} else if resp.StatusCode >= 200 &&
+				resp.StatusCode < 300 {
 				c.cacheSet(cacheKey, body)
 				return body, nil
 			} else {
-				lastErr = fmt.Errorf("upstream returned HTTP %d", resp.StatusCode)
-				if resp.StatusCode != http.StatusTooManyRequests &&
+				lastErr = fmt.Errorf(
+					"upstream HTTP %d",
+					resp.StatusCode,
+				)
+
+				if resp.StatusCode != 429 &&
 					resp.StatusCode < 500 {
-					return nil, lastErr
+					return nil, &ProviderError{
+						Code:    "UPSTREAM_HTTP_ERROR",
+						Message: lastErr.Error(),
+					}
 				}
 			}
 		}
 
 		if attempt < c.config.Retries {
 			delay := time.Duration(attempt+1) * 500 * time.Millisecond
+
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -219,271 +216,536 @@ func (c *Client) request(ctx context.Context, params url.Values) ([]byte, error)
 		}
 	}
 
-	return nil, lastErr
+	return nil, &ProviderError{
+		Code:      "NETWORK_ERROR",
+		Message:   fmt.Sprintf("Dramachi request failed: %v", lastErr),
+		Retryable: true,
+	}
 }
 
-func decodeJSON[T any](data []byte) (T, error) {
-	var result T
-	err := json.Unmarshal(data, &result)
-	return result, err
-}
-
-func (c *Client) upstream(ctx context.Context, params url.Values) (map[string]json.RawMessage, error) {
-	data, err := c.request(ctx, params)
+func (c *Client) upstream(
+	ctx context.Context,
+	params url.Values,
+) (map[string]json.RawMessage, error) {
+	body, err := c.request(ctx, params)
 	if err != nil {
 		return nil, err
 	}
 
 	var result map[string]json.RawMessage
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, &ProviderError{
+			Code:    "PARSE_ERROR",
+			Message: "Invalid JSON response from Dramachi",
+		}
 	}
+
 	return result, nil
 }
 
+// --------------------------------------------------
+// JSON HELPERS
+// --------------------------------------------------
+
 func rawArray(data json.RawMessage) []json.RawMessage {
-	var items []json.RawMessage
-	_ = json.Unmarshal(data, &items)
-	return items
+	var result []json.RawMessage
+	_ = json.Unmarshal(data, &result)
+	return result
 }
 
 func rawString(data json.RawMessage) string {
-	var value string
-	_ = json.Unmarshal(data, &value)
-	return value
+	var result string
+	_ = json.Unmarshal(data, &result)
+	return result
 }
 
-func firstString(object map[string]json.RawMessage, keys ...string) string {
+func rawInt(data json.RawMessage) int {
+	var result int
+	_ = json.Unmarshal(data, &result)
+	return result
+}
+
+func firstString(
+	object map[string]json.RawMessage,
+	keys ...string,
+) string {
 	for _, key := range keys {
-		if value := rawString(object[key]); value != "" {
+		value := rawString(object[key])
+		if value != "" {
 			return value
 		}
 	}
 	return ""
 }
 
-func (c *Client) search(ctx context.Context, query string, page int) (SearchResponse, error) {
-	params := url.Values{
+func objectValue(
+	data json.RawMessage,
+) map[string]json.RawMessage {
+	var result map[string]json.RawMessage
+	_ = json.Unmarshal(data, &result)
+	return result
+}
+
+func parseNumber(values ...string) int {
+	re := regexp.MustCompile(`(?i)(?:episode|ep|e)[\s._-]*(\d+)`)
+
+	for _, value := range values {
+		match := re.FindStringSubmatch(value)
+		if len(match) == 2 {
+			number, _ := strconv.Atoi(match[1])
+			return number
+		}
+	}
+
+	return 0
+}
+
+func seasonNumber(name string, fallback int) int {
+	re := regexp.MustCompile(`\d+`)
+	match := re.FindString(name)
+
+	if match == "" {
+		return fallback
+	}
+
+	number, err := strconv.Atoi(match)
+	if err != nil || number < 1 {
+		return fallback
+	}
+
+	return number
+}
+
+func makeEpisodeID(ref EpisodeRef) string {
+	data, _ := json.Marshal(ref)
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeEpisodeID(id string) (EpisodeRef, error) {
+	var ref EpisodeRef
+
+	data, err := base64.RawURLEncoding.DecodeString(id)
+	if err != nil {
+		return ref, errors.New("invalid episode id")
+	}
+
+	if err := json.Unmarshal(data, &ref); err != nil {
+		return ref, errors.New("invalid episode id")
+	}
+
+	if ref.TitleID == "" ||
+		ref.RIP == "" ||
+		ref.FID == "" ||
+		ref.Disk == "" {
+		return ref, errors.New("incomplete episode id")
+	}
+
+	return ref, nil
+}
+
+// --------------------------------------------------
+// SEARCH
+// --------------------------------------------------
+
+func (c *Client) search(
+	ctx context.Context,
+	query string,
+	page int,
+) ([]map[string]any, error) {
+	result, err := c.upstream(ctx, url.Values{
 		"interface": {"search"},
 		"q":         {query},
 		"filter":    {"all"},
 		"page":      {strconv.Itoa(page)},
-	}
-
-	result, err := c.upstream(ctx, params)
+	})
 	if err != nil {
-		return SearchResponse{}, err
+		return nil, err
 	}
 
-	var items []SearchItem
-	for _, raw := range rawArray(result["data"]) {
-		var item SearchItem
-		if err := json.Unmarshal(raw, &item); err != nil {
+	items := rawArray(result["data"])
+	if len(items) == 0 {
+		items = rawArray(result["results"])
+	}
+
+	output := make([]map[string]any, 0, len(items))
+
+	for _, raw := range items {
+		item := objectValue(raw)
+
+		id := firstString(item, "id")
+		title := firstString(item, "title", "name")
+
+		if id == "" || title == "" {
 			continue
 		}
-		if item.ID == "" {
-			item.ID = firstString(map[string]json.RawMessage{
-				"id": raw,
-			}, "id")
+
+		poster := firstString(item, "thumb", "poster", "image")
+		if poster != "" &&
+			!strings.HasPrefix(poster, "https://") {
+			poster = posterBaseURL + strings.TrimLeft(poster, "/")
 		}
-		if item.Thumb != "" && !strings.HasPrefix(item.Thumb, "http") {
-			item.Thumb = posterBaseURL + strings.TrimLeft(item.Thumb, "/")
-		}
-		items = append(items, item)
+
+		year := firstString(item, "year")
+
+		output = append(output, map[string]any{
+			"id":            id,
+			"provider":      providerID,
+			"title":         title,
+			"media_type":    "series",
+			"year":          year,
+			"poster":        poster,
+			"episode_count": nil,
+			"season_count":  nil,
+		})
 	}
 
-	var lastPage, nextPage int
-	_ = json.Unmarshal(result["last_page"], &lastPage)
-	_ = json.Unmarshal(result["next_page"], &nextPage)
-
-	return SearchResponse{
-		Items:    items,
-		Page:     page,
-		LastPage: lastPage,
-		NextPage: nextPage,
-	}, nil
+	return output, nil
 }
 
-func (c *Client) details(ctx context.Context, id string) (map[string]json.RawMessage, error) {
+// --------------------------------------------------
+// DETAILS
+// --------------------------------------------------
+
+func (c *Client) details(
+	ctx context.Context,
+	id string,
+) (map[string]json.RawMessage, error) {
 	return c.upstream(ctx, url.Values{
 		"interface": {"title_v2"},
 		"id":        {id},
 	})
 }
 
-func (c *Client) seasons(ctx context.Context, id string) ([]Season, error) {
+func (c *Client) getSeasons(
+	ctx context.Context,
+	id string,
+) ([]map[string]json.RawMessage, error) {
 	details, err := c.details(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	var album map[string]json.RawMessage
-	_ = json.Unmarshal(details["album"], &album)
-
-	rawSeasons := rawArray(details["seasons"])
-	if len(rawSeasons) == 0 {
-		rawSeasons = rawArray(details["data"])
+	seasons := rawArray(details["seasons"])
+	if len(seasons) == 0 {
+		seasons = rawArray(details["data"])
 	}
 
-	var seasons []Season
+	result := make([]map[string]json.RawMessage, 0, len(seasons))
 
-	for _, raw := range rawSeasons {
-		var item map[string]json.RawMessage
-		if json.Unmarshal(raw, &item) != nil {
-			continue
-		}
+	for _, raw := range seasons {
+		item := objectValue(raw)
 
 		rip := firstString(item, "rip")
 		if rip == "" {
 			continue
 		}
 
-		name := firstString(item, "season_name", "name")
-		version := firstString(item, "version_name", "version")
-
-		seasons = append(seasons, Season{
-			Name:       name,
-			Version:    version,
-			RIP:        rip,
-			Server:     firstString(item, "server"),
-			TitleID:    id,
-			Identifier: id + "::" + rip,
-		})
+		result = append(result, item)
 	}
 
-	return seasons, nil
+	return result, nil
 }
 
-func (c *Client) episodes(ctx context.Context, id, rip string) ([]Episode, error) {
-	params := url.Values{
+// --------------------------------------------------
+// EPISODES
+// --------------------------------------------------
+
+func (c *Client) getSeasonEpisodes(
+	ctx context.Context,
+	id string,
+	rip string,
+) ([]map[string]any, error) {
+	result, err := c.upstream(ctx, url.Values{
 		"interface": {"eplist"},
 		"id":        {id},
 		"season":    {rip},
-	}
-
-	result, err := c.upstream(ctx, params)
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	rawEpisodes := rawArray(result["data"])
-	if len(rawEpisodes) == 0 {
-		rawEpisodes = rawArray(result["episodes"])
+	items := rawArray(result["data"])
+	if len(items) == 0 {
+		items = rawArray(result["episodes"])
 	}
 
-	episodes := make([]Episode, 0, len(rawEpisodes))
+	output := make([]map[string]any, 0, len(items))
 
-	for index, raw := range rawEpisodes {
-		var item map[string]json.RawMessage
-		if json.Unmarshal(raw, &item) != nil {
+	for index, raw := range items {
+		item := objectValue(raw)
+
+		fid := firstString(item, "fid")
+		disk := firstString(item, "disk")
+
+		if fid == "" || disk == "" {
 			continue
 		}
 
-		episode := Episode{
-			Title:   firstString(item, "title"),
-			RIP:     firstString(item, "rip"),
-			FTitle:  firstString(item, "f_title"),
-			FID:     firstString(item, "fid"),
-			Disk:    firstString(item, "disk"),
-			Quality: firstString(item, "quality"),
-			Size:    firstString(item, "size"),
+		title := firstString(item, "title", "f_title")
+		fileTitle := firstString(item, "f_title")
+
+		number := parseNumber(fileTitle, title)
+		if number == 0 {
+			number = index + 1
 		}
 
-		episode.Number = parseEpisodeNumber(episode.FTitle, episode.Title)
-		if episode.Number == 0 {
-			episode.Number = index + 1
+		ref := EpisodeRef{
+			TitleID: id,
+			RIP:     rip,
+			FID:     fid,
+			Disk:    disk,
+			Number:  number,
 		}
 
-		episodes = append(episodes, episode)
+		output = append(output, map[string]any{
+			"id":          makeEpisodeID(ref),
+			"number":      number,
+			"season":      1,
+			"title":       title,
+			"description": nil,
+			"quality":     firstString(item, "quality"),
+			"size":        firstString(item, "size"),
+		})
 	}
 
-	sort.SliceStable(episodes, func(i, j int) bool {
-		return episodes[i].Number < episodes[j].Number
-	})
-
-	return episodes, nil
+	return output, nil
 }
 
-func parseEpisodeNumber(values ...string) int {
-	for _, value := range values {
-		lower := strings.ToLower(value)
-		for _, marker := range []string{"episode", "ep", "e"} {
-			index := strings.Index(lower, marker)
-			if index < 0 {
-				continue
-			}
+func (c *Client) episodes(
+	ctx context.Context,
+	id string,
+) (map[string]any, error) {
+	seasons, err := c.getSeasons(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 
-			start := index + len(marker)
-			for start < len(value) && (value[start] == ' ' || value[start] == '-' || value[start] == '_') {
-				start++
-			}
+	allEpisodes := make([]map[string]any, 0)
+	seriesTitle := id
 
-			end := start
-			for end < len(value) && value[end] >= '0' && value[end] <= '9' {
-				end++
-			}
-
-			if end > start {
-				number, _ := strconv.Atoi(value[start:end])
-				return number
-			}
+	details, detailErr := c.details(ctx, id)
+	if detailErr == nil {
+		seriesTitle = firstString(
+			details,
+			"title",
+			"name",
+		)
+		if seriesTitle == "" {
+			album := objectValue(details["album"])
+			seriesTitle = firstString(album, "title", "name")
 		}
 	}
-	return 0
+	if seriesTitle == "" {
+		seriesTitle = id
+	}
+
+	for index, season := range seasons {
+		rip := firstString(season, "rip")
+		if rip == "" {
+			continue
+		}
+
+		name := firstString(
+			season,
+			"season_name",
+			"name",
+			"version_name",
+		)
+		seasonNo := seasonNumber(name, index+1)
+
+		seasonEpisodes, err := c.getSeasonEpisodes(
+			ctx,
+			id,
+			rip,
+		)
+		if err != nil {
+			log.Printf("episode list error for rip %s: %v", rip, err)
+			continue
+		}
+
+		for _, episode := range seasonEpisodes {
+			episode["season"] = seasonNo
+			allEpisodes = append(allEpisodes, episode)
+		}
+	}
+
+	if len(allEpisodes) == 0 {
+		return nil, &ProviderError{
+			Code:    "NOT_FOUND",
+			Message: "No episodes found",
+		}
+	}
+
+	return map[string]any{
+		"provider":  providerID,
+		"anime_id":  id,
+		"title":     seriesTitle,
+		"episodes":  allEpisodes,
+	}, nil
 }
 
-func (c *Client) resolve(ctx context.Context, id string, episode Episode) ([]Source, error) {
-	if episode.FID == "" || episode.Disk == "" {
-		return nil, errors.New("episode is missing fid or disk")
+// --------------------------------------------------
+// SOURCE LOOKUP
+// --------------------------------------------------
+
+func (c *Client) sources(
+	ctx context.Context,
+	animeID string,
+	episodeID string,
+) (map[string]any, error) {
+	ref, err := decodeEpisodeID(episodeID)
+	if err != nil || ref.TitleID != animeID {
+		return nil, &ProviderError{
+			Code:    "INVALID_ID",
+			Message: "Invalid episode ID",
+		}
 	}
 
 	result, err := c.upstream(ctx, url.Values{
 		"interface": {"getFile"},
-		"fid":       {episode.FID},
-		"findex":    {episode.Disk},
+		"fid":       {ref.FID},
+		"findex":    {ref.Disk},
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	rawFiles := rawArray(result["fileInfo"])
-	var sources []Source
+	files := rawArray(result["fileInfo"])
+	sources := make([]map[string]any, 0, len(files))
 
-	for _, raw := range rawFiles {
+	for index, raw := range files {
 		var file FileInfo
-		if json.Unmarshal(raw, &file) != nil {
+		if err := json.Unmarshal(raw, &file); err != nil {
 			continue
 		}
 
 		parsed, err := url.Parse(file.URL)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		if err != nil ||
+			parsed.Scheme != "https" ||
+			parsed.Host == "" ||
+			parsed.User != nil {
 			continue
 		}
 
-		sources = append(sources, Source{
-			Provider: "dramachi",
-			Title:    episode.Title,
-			URL:      file.URL,
-			Filename: file.Filename,
-			Quality:  episode.Quality,
-			Size:     file.Size,
-			Host:     file.Host,
-			IsDirect: file.IsDL,
+		label := file.Host
+		if label == "" {
+			label = "Dramachi"
+		}
+
+		sourceID := fmt.Sprintf("%s-%d", ref.FID, index+1)
+
+		sources = append(sources, map[string]any{
+			"id":       sourceID,
+			"label":    label,
+			"type":     "file",
+			"url":      file.URL,
+			"quality":  nil,
+			"language": nil,
+			"headers":  map[string]string{},
+			"direct_file": file.IsDL,
+			"filename": file.Filename,
+			"size":     file.Size,
 		})
 	}
 
-	return sources, nil
+	if len(sources) == 0 {
+		return nil, &ProviderError{
+			Code:      "SOURCE_UNAVAILABLE",
+			Message:   "No valid source was returned by Dramachi",
+			Retryable: true,
+		}
+	}
+
+	return map[string]any{
+		"provider":    providerID,
+		"anime_id":    animeID,
+		"episode_id":  episodeID,
+		"source_id":   nil,
+		"sources":     sources,
+		"subtitles":   []any{},
+	}, nil
 }
 
-func responseError(c *fiber.Ctx, status int, message string) error {
-	return c.Status(status).JSON(APIError{
-		Status:  status,
-		Message: message,
-	})
+// --------------------------------------------------
+// RESPONSE HELPERS
+// --------------------------------------------------
+
+func success(
+	provider string,
+	action string,
+	data any,
+) fiber.Map {
+	return fiber.Map{
+		"status":   "success",
+		"provider": provider,
+		"action":   action,
+		"data":     data,
+	}
 }
+
+func failure(
+	provider string,
+	action string,
+	code string,
+	message string,
+	retryable bool,
+) fiber.Map {
+	return fiber.Map{
+		"status": "error",
+		"error": fiber.Map{
+			"code":      code,
+			"message":   message,
+			"provider":  provider,
+			"action":    action,
+			"retryable": retryable,
+		},
+	}
+}
+
+func sendError(
+	c *fiber.Ctx,
+	provider string,
+	action string,
+	err error,
+) error {
+	var providerErr *ProviderError
+
+	if errors.As(err, &providerErr) {
+		return c.JSON(failure(
+			provider,
+			action,
+			providerErr.Code,
+			providerErr.Message,
+			providerErr.Retryable,
+		))
+	}
+
+	log.Printf("%s %s error: %v", provider, action, err)
+
+	code := "INTERNAL_ERROR"
+	retryable := false
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		code = "TIMEOUT"
+		retryable = true
+	}
+
+	return c.JSON(failure(
+		provider,
+		action,
+		code,
+		"An internal provider error occurred.",
+		retryable,
+	))
+}
+
+// --------------------------------------------------
+// MAIN ROUTES
+// --------------------------------------------------
 
 func main() {
 	client := NewClient()
+
 	app := fiber.New(fiber.Config{
 		AppName:      "Dramachi Prophecy Sub Server",
 		ReadTimeout:  30 * time.Second,
@@ -492,134 +754,185 @@ func main() {
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"service": "dramachi-prophecy-sub-server",
+			"name":    "Dramachi Prophecy Sub Server",
 			"status":  "online",
+			"version": "1.0.0",
+			"health":  "/health",
 		})
 	})
 
 	app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"status": "ok"})
-	})
-
-	app.Get("/api/v1/search", func(c *fiber.Ctx) error {
-		query := strings.TrimSpace(c.Query("q"))
-		page := c.QueryInt("page", 1)
-
-		if query == "" {
-			return responseError(c, 400, "query parameter q is required")
-		}
-		if page < 1 {
-			page = 1
-		}
-
-		result, err := client.search(c.UserContext(), query, page)
-		if err != nil {
-			log.Printf("search error: %v", err)
-			return responseError(c, 502, "upstream search failed")
-		}
 		return c.JSON(fiber.Map{
-			"status": "success",
-			"data":   result,
+			"status":          "ok",
+			"service":         "prophecy-dramachi",
+			"provider_enabled": true,
 		})
 	})
 
-	app.Get("/api/v1/title/:id", func(c *fiber.Ctx) error {
-		id := strings.TrimSpace(c.Params("id"))
+	// SEARCH
+	app.Get("/api/v1/anime/search", func(c *fiber.Ctx) error {
+		query := strings.TrimSpace(c.Query("q"))
+		page := c.QueryInt("page", 1)
+
+		if query == "" || len(query) > 150 {
+			return c.JSON(failure(
+				providerID,
+				"search",
+				"INVALID_PARAMETERS",
+				"Search query is required.",
+				false,
+			))
+		}
+
+		if page < 1 || page > 64 {
+			return c.JSON(failure(
+				providerID,
+				"search",
+				"INVALID_PAGE",
+				"Invalid search page.",
+				false,
+			))
+		}
+
+		result, err := client.search(
+			c.UserContext(),
+			query,
+			page,
+		)
+		if err != nil {
+			return sendError(c, providerID, "search", err)
+		}
+
+		return c.JSON(success(providerID, "search", result))
+	})
+
+	// DETAILS
+	app.Get("/api/v1/anime/:slug", func(c *fiber.Ctx) error {
+		id := strings.TrimSpace(c.Params("slug"))
+
 		if id == "" {
-			return responseError(c, 400, "title id is required")
+			return c.JSON(failure(
+				providerID,
+				"details",
+				"INVALID_ID",
+				"Anime ID is required.",
+				false,
+			))
 		}
 
 		details, err := client.details(c.UserContext(), id)
 		if err != nil {
-			log.Printf("details error: %v", err)
-			return responseError(c, 502, "upstream details failed")
+			return sendError(c, providerID, "details", err)
 		}
 
-		seasons, seasonErr := client.seasons(c.UserContext(), id)
-		if seasonErr != nil {
-			log.Printf("season error: %v", seasonErr)
+		title := firstString(details, "title", "name")
+		if title == "" {
+			album := objectValue(details["album"])
+			title = firstString(album, "title", "name")
+		}
+		if title == "" {
+			title = id
 		}
 
-		return c.JSON(fiber.Map{
-			"status":  "success",
-			"data":    details,
-			"seasons": seasons,
-		})
+		seasonItems, err := client.getSeasons(c.UserContext(), id)
+		if err != nil {
+			return sendError(c, providerID, "details", err)
+		}
+
+		seasonOutput := make([]map[string]any, 0, len(seasonItems))
+
+		for index, item := range seasonItems {
+			rip := firstString(item, "rip")
+			name := firstString(
+				item,
+				"season_name",
+				"name",
+				"version_name",
+			)
+
+			seasonOutput = append(seasonOutput, map[string]any{
+				"number":             seasonNumber(name, index+1),
+				"provider_season_id": rip,
+				"name":               name,
+				"episodes":           []any{},
+			})
+		}
+
+		poster := firstString(details, "thumb", "poster")
+		if poster != "" &&
+			!strings.HasPrefix(poster, "https://") {
+			poster = posterBaseURL + strings.TrimLeft(poster, "/")
+		}
+
+		data := map[string]any{
+			"id":           id,
+			"provider":     providerID,
+			"title":        title,
+			"media_type":   "series",
+			"year":         firstString(details, "year"),
+			"description":  firstString(details, "content", "description"),
+			"poster":       poster,
+			"genres":       []any{},
+			"season_count": len(seasonOutput),
+			"seasons":      seasonOutput,
+		}
+
+		return c.JSON(success(providerID, "details", data))
 	})
 
-	app.Get("/api/v1/title/:id/seasons", func(c *fiber.Ctx) error {
-		seasons, err := client.seasons(c.UserContext(), c.Params("id"))
-		if err != nil {
-			return responseError(c, 502, "upstream seasons failed")
+	// EPISODES
+	app.Get("/api/v1/anime/:slug/episodes", func(c *fiber.Ctx) error {
+		id := strings.TrimSpace(c.Params("slug"))
+
+		if id == "" {
+			return c.JSON(failure(
+				providerID,
+				"episodes",
+				"INVALID_ID",
+				"Anime ID is required.",
+				false,
+			))
 		}
-		return c.JSON(fiber.Map{
-			"status": "success",
-			"data":   seasons,
-		})
+
+		result, err := client.episodes(c.UserContext(), id)
+		if err != nil {
+			return sendError(c, providerID, "episodes", err)
+		}
+
+		return c.JSON(success(providerID, "episodes", result))
 	})
 
-	app.Get("/api/v1/title/:id/seasons/:rip/episodes", func(c *fiber.Ctx) error {
-		episodes, err := client.episodes(
-			c.UserContext(),
-			c.Params("id"),
-			c.Params("rip"),
-		)
-		if err != nil {
-			return responseError(c, 502, "upstream episodes failed")
-		}
+	// SOURCES
+	app.Get(
+		"/api/v1/anime/:slug/episodes/:episode_id/sources",
+		func(c *fiber.Ctx) error {
+			id := strings.TrimSpace(c.Params("slug"))
+			episodeID := strings.TrimSpace(c.Params("episode_id"))
 
-		return c.JSON(fiber.Map{
-			"status": "success",
-			"data":   episodes,
-		})
-	})
-
-	app.Get("/api/v1/title/:id/seasons/:rip/episodes/:number/sources", func(c *fiber.Ctx) error {
-		number := c.Params("number")
-		episodeNumber, err := strconv.Atoi(number)
-		if err != nil || episodeNumber < 1 {
-			return responseError(c, 400, "invalid episode number")
-		}
-
-		episodes, err := client.episodes(
-			c.UserContext(),
-			c.Params("id"),
-			c.Params("rip"),
-		)
-		if err != nil {
-			return responseError(c, 502, "upstream episodes failed")
-		}
-
-		var selected *Episode
-		for i := range episodes {
-			if episodes[i].Number == episodeNumber {
-				selected = &episodes[i]
-				break
+			if id == "" || episodeID == "" {
+				return c.JSON(failure(
+					providerID,
+					"sources",
+					"INVALID_PARAMETERS",
+					"Anime ID and episode ID are required.",
+					false,
+				))
 			}
-		}
 
-		if selected == nil {
-			return responseError(c, 404, "episode not found")
-		}
+			result, err := client.sources(
+				c.UserContext(),
+				id,
+				episodeID,
+			)
+			if err != nil {
+				return sendError(c, providerID, "sources", err)
+			}
 
-		sources, err := client.resolve(c.UserContext(), c.Params("id"), *selected)
-		if err != nil {
-			log.Printf("source resolve error: %v", err)
-			return responseError(c, 502, "upstream source lookup failed")
-		}
+			return c.JSON(success(providerID, "sources", result))
+		},
+	)
 
-		return c.JSON(fiber.Map{
-			"status":   "success",
-			"provider": "dramachi",
-			"action":   "sources",
-			"data": fiber.Map{
-				"episode": *selected,
-				"sources": sources,
-			},
-		})
-	})
-
-	port := os.Getenv("PORT")
+	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "10000"
 	}
